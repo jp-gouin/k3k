@@ -37,6 +37,7 @@ var (
 	altNames                cli.StringSlice
 	expirationDays          int64
 	configName              string
+	kubeconfigServerHost    string
 	generateKubeconfigFlags = []cli.Flag{
 		cli.StringFlag{
 			Name:        "name",
@@ -69,6 +70,12 @@ var (
 			Usage:       "Expiration date of the certificates used for the kubeconfig",
 			Destination: &expirationDays,
 			Value:       356,
+		},
+		cli.StringFlag{
+			Name:        "kubeconfig-server",
+			Usage:       "override the kubeconfig server host",
+			Destination: &kubeconfigServerHost,
+			Value:       "",
 		},
 	}
 )
@@ -121,6 +128,9 @@ func generate(clx *cli.Context) error {
 		return err
 	}
 	host := strings.Split(url.Host, ":")
+	if kubeconfigServerHost != "" {
+		host = []string{kubeconfigServerHost}
+	}
 
 	certAltNames := kubeconfig.AddSANs(altNames)
 	if org == nil {

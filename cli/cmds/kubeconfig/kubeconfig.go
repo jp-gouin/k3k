@@ -11,6 +11,7 @@ import (
 	"github.com/rancher/k3k/cli/cmds"
 	"github.com/rancher/k3k/pkg/apis/k3k.io/v1alpha1"
 	"github.com/rancher/k3k/pkg/controller"
+	"github.com/rancher/k3k/pkg/controller/certs"
 	"github.com/rancher/k3k/pkg/controller/kubeconfig"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
@@ -132,7 +133,7 @@ func generate(clx *cli.Context) error {
 		host = []string{kubeconfigServerHost}
 	}
 
-	certAltNames := kubeconfig.AddSANs(altNames)
+	certAltNames := certs.AddSANs(altNames)
 	if org == nil {
 		org = cli.StringSlice{user.SystemPrivilegedGroup}
 	}

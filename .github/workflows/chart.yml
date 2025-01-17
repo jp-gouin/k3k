@@ -23,7 +23,7 @@ jobs:
 
     - name: Release Chart
       run: |
-        gh release upload ${{ github.ref_name }} deploy/*
+        gh release upload ${{ github.ref_name }} deploy/k3k/*
       
     - name: Index Chart
       run: |

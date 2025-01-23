@@ -20,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlruntimecontroller "sigs.k8s.io/controller-runtime/pkg/controller"
@@ -44,21 +45,32 @@ const (
 )
 
 type ClusterReconciler struct {
-	Client           ctrlruntimeclient.Client
-	Scheme           *runtime.Scheme
-	SharedAgentImage string
-	logger           *log.Logger
+	DiscoveryClient            *discovery.DiscoveryClient
+	Client                     ctrlruntimeclient.Client
+	Scheme                     *runtime.Scheme
+	SharedAgentImage           string
+	SharedAgentImagePullPolicy string
+	logger                     *log.Logger
 }
 
 // Add adds a new controller to the manager
-func Add(ctx context.Context, mgr manager.Manager, sharedAgentImage string, logger *log.Logger) error {
+func Add(ctx context.Context, mgr manager.Manager, sharedAgentImage, sharedAgentImagePullPolicy string, logger *log.Logger) error {
+
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig())
+	if err != nil {
+		return err
+	}
+
 	// initialize a new Reconciler
 	reconciler := ClusterReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		SharedAgentImage: sharedAgentImage,
-		logger:           logger.Named(clusterController),
+		DiscoveryClient:            discoveryClient,
+		Client:                     mgr.GetClient(),
+		Scheme:                     mgr.GetScheme(),
+		SharedAgentImage:           sharedAgentImage,
+		SharedAgentImagePullPolicy: sharedAgentImagePullPolicy,
+		logger:                     logger.Named(clusterController),
 	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Cluster{}).
 		WithOptions(ctrlruntimecontroller.Options{
@@ -76,6 +88,22 @@ func (c *ClusterReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	if err := c.Client.Get(ctx, req.NamespacedName, &cluster); err != nil {
 		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
 	}
+
+	// if the Version is not specified we will try to use the same Kubernetes version of the host.
+	// This version is stored in the Status object, and it will not be updated if already set.
+	if cluster.Spec.Version == "" && cluster.Status.HostVersion == "" {
+		hostVersion, err := c.DiscoveryClient.ServerVersion()
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+
+		// update Status HostVersion
+		cluster.Status.HostVersion = fmt.Sprintf("v%s.%s.0-k3s1", hostVersion.Major, hostVersion.Minor)
+		if err := c.Client.Status().Update(ctx, &cluster); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
 	if cluster.DeletionTimestamp.IsZero() {
 		if !controllerutil.ContainsFinalizer(&cluster, clusterFinalizerName) {
 			controllerutil.AddFinalizer(&cluster, clusterFinalizerName)
@@ -338,7 +366,7 @@ func (c *ClusterReconciler) unbindNodeProxyClusterRole(ctx context.Context, clus
 }
 
 func (c *ClusterReconciler) agent(ctx context.Context, cluster *v1alpha1.Cluster, serviceIP, token string) error {
-	agent := agent.New(cluster, serviceIP, c.SharedAgentImage, token)
+	agent := agent.New(cluster, serviceIP, c.SharedAgentImage, c.SharedAgentImagePullPolicy, token)
 	agentsConfig := agent.Config()
 	agentResources, err := agent.Resources()
 	if err != nil {

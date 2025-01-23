@@ -66,6 +66,10 @@ func (c *ControllerHandler) AddResource(ctx context.Context, obj client.Object) 
 				// note that this doesn't do any type safety - fix this
 				// when generics work
 				c.Translater.TranslateTo(s)
+				// Remove service-account-token types when synced to the host
+				if s.Type == v1.SecretTypeServiceAccountToken {
+					s.Type = v1.SecretTypeOpaque
+				}
 				return s, nil
 			},
 			Logger: c.Logger,
@@ -109,7 +113,7 @@ func (c *ControllerHandler) RemoveResource(ctx context.Context, obj client.Objec
 	ctrl, ok := c.controllers[obj.GetObjectKind().GroupVersionKind()]
 	c.RUnlock()
 	if !ok {
-		return fmt.Errorf("no controller found for gvk" + obj.GetObjectKind().GroupVersionKind().String())
+		return fmt.Errorf("no controller found for gvk %s", obj.GetObjectKind().GroupVersionKind())
 	}
 	return ctrl.RemoveResource(ctx, obj.GetNamespace(), obj.GetName())
 }

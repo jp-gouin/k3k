@@ -8,16 +8,18 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/pkg/errors"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/rancher/k3k/k3k-kubelet/controller"
+	"github.com/rancher/k3k/k3k-kubelet/controller/webhook"
 	"github.com/rancher/k3k/k3k-kubelet/provider/collectors"
 	"github.com/rancher/k3k/k3k-kubelet/translate"
 	"github.com/rancher/k3k/pkg/apis/k3k.io/v1alpha1"
 	k3klog "github.com/rancher/k3k/pkg/log"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api/statsv1alpha1"
+	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -26,8 +28,11 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	cv1 "k8s.io/client-go/kubernetes/typed/core/v1"
+
+	"errors"
 
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/portforward"
@@ -37,6 +42,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
+
+// check at compile time if the Provider implements the nodeutil.Provider interface
+var _ nodeutil.Provider = (*Provider)(nil)
 
 // Provider implements nodetuil.Provider from virtual Kubelet.
 // TODO: Implement NotifyPods and the required usage so that this can be an async provider
@@ -53,6 +61,10 @@ type Provider struct {
 	dnsIP            string
 	logger           *k3klog.Logger
 }
+
+var (
+	ErrRetryTimeout = errors.New("provider timed out")
+)
 
 func New(hostConfig rest.Config, hostMgr, virtualMgr manager.Manager, logger *k3klog.Logger, namespace, name, serverIP, dnsIP string) (*Provider, error) {
 	coreClient, err := cv1.NewForConfig(&hostConfig)
@@ -262,7 +274,7 @@ func (p *Provider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary,
 func (p *Provider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily, error) {
 	statsSummary, err := p.GetStatsSummary(ctx)
 	if err != nil {
-		return nil, errors.Wrapf(err, "error fetching MetricsResource")
+		return nil, errors.Join(err, errors.New("error fetching MetricsResource"))
 	}
 
 	registry := compbasemetrics.NewKubeRegistry()
@@ -270,7 +282,7 @@ func (p *Provider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily,
 
 	metricFamily, err := registry.Gather()
 	if err != nil {
-		return nil, errors.Wrapf(err, "error gathering metrics from collector")
+		return nil, errors.Join(err, errors.New("error gathering metrics from collector"))
 	}
 	return metricFamily, nil
 }
@@ -306,8 +318,13 @@ func (p *Provider) PortForward(ctx context.Context, namespace, pod string, port 
 	return fw.ForwardPorts()
 }
 
-// CreatePod takes a Kubernetes Pod and deploys it within the provider.
+// CreatePod executes createPod with retry
 func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
+	return p.withRetry(ctx, p.createPod, pod)
+}
+
+// createPod takes a Kubernetes Pod and deploys it within the provider.
+func (p *Provider) createPod(ctx context.Context, pod *corev1.Pod) error {
 	tPod := pod.DeepCopy()
 	p.Translater.TranslateTo(tPod)
 
@@ -338,6 +355,10 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		tPod.Spec.Priority = nil
 	}
 
+	// fieldpath annotations
+	if err := p.configureFieldPathEnv(pod, tPod); err != nil {
+		return fmt.Errorf("unable to fetch fieldpath annotations for pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
 	// volumes will often refer to resources in the virtual cluster, but instead need to refer to the sync'd
 	// host cluster version
 	if err := p.transformVolumes(ctx, pod.Namespace, tPod.Spec.Volumes); err != nil {
@@ -348,11 +369,33 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return fmt.Errorf("unable to transform tokens for pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	// inject networking information to the pod including the virtual cluster controlplane endpoint
-	p.configureNetworking(pod.Name, pod.Namespace, tPod)
+	p.configureNetworking(pod.Name, pod.Namespace, tPod, p.serverIP)
 
 	p.logger.Infow("Creating pod", "Host Namespace", tPod.Namespace, "Host Name", tPod.Name,
 		"Virtual Namespace", pod.Namespace, "Virtual Name", "env", pod.Name, pod.Spec.Containers[0].Env)
 	return p.HostClient.Create(ctx, tPod)
+}
+
+// withRetry retries passed function with interval and timeout
+func (p *Provider) withRetry(ctx context.Context, f func(context.Context, *v1.Pod) error, pod *v1.Pod) error {
+	const (
+		interval = 2 * time.Second
+		timeout  = 10 * time.Second
+	)
+	var allErrors error
+	// retryFn will retry until the operation succeed, or the timeout occurs
+	retryFn := func(ctx context.Context) (bool, error) {
+		if lastErr := f(ctx, pod); lastErr != nil {
+			// log that the retry failed?
+			allErrors = errors.Join(allErrors, lastErr)
+			return false, nil
+		}
+		return true, nil
+	}
+	if err := wait.PollUntilContextTimeout(ctx, interval, timeout, true, retryFn); err != nil {
+		return errors.Join(allErrors, ErrRetryTimeout)
+	}
+	return nil
 }
 
 // transformVolumes changes the volumes to the representation in the host cluster. Will return an error
@@ -408,6 +451,7 @@ func (p *Provider) transformVolumes(ctx context.Context, podNamespace string, vo
 	return nil
 }
 
+// syncConfigmap will add the configmap object to the queue of the syncer controller to be synced to the host cluster
 func (p *Provider) syncConfigmap(ctx context.Context, podNamespace string, configMapName string, optional bool) error {
 	var configMap corev1.ConfigMap
 	nsName := types.NamespacedName{
@@ -429,7 +473,9 @@ func (p *Provider) syncConfigmap(ctx context.Context, podNamespace string, confi
 	return nil
 }
 
+// syncSecret will add the secret object to the queue of the syncer controller to be synced to the host cluster
 func (p *Provider) syncSecret(ctx context.Context, podNamespace string, secretName string, optional bool) error {
+	p.logger.Infow("Syncing secret", "Name", secretName, "Namespace", podNamespace, "optional", optional)
 	var secret corev1.Secret
 	nsName := types.NamespacedName{
 		Namespace: podNamespace,
@@ -444,38 +490,95 @@ func (p *Provider) syncSecret(ctx context.Context, podNamespace string, secretNa
 	}
 	err = p.Handler.AddResource(ctx, &secret)
 	if err != nil {
-		return fmt.Errorf("unable to add configmap to sync %s/%s: %w", nsName.Namespace, nsName.Name, err)
+		return fmt.Errorf("unable to add secret to sync %s/%s: %w", nsName.Namespace, nsName.Name, err)
 	}
 	return nil
 }
 
-// UpdatePod takes a Kubernetes Pod and updates it within the provider.
+// UpdatePod executes updatePod with retry
 func (p *Provider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
-	hostName := p.Translater.TranslateName(pod.Namespace, pod.Name)
-	currentPod, err := p.GetPod(ctx, p.ClusterNamespace, hostName)
-	if err != nil {
-		return fmt.Errorf("unable to get current pod for update: %w", err)
-	}
-	tPod := pod.DeepCopy()
-	p.Translater.TranslateTo(tPod)
-	tPod.UID = currentPod.UID
-	// this is a bit dangerous since another process could have made changes that the user didn't know about
-	tPod.ResourceVersion = currentPod.ResourceVersion
-
-	// Volumes may refer to resources (configmaps/secrets) from the host cluster
-	// So we need the configuration as calculated during create time
-	tPod.Spec.Volumes = currentPod.Spec.Volumes
-	tPod.Spec.Containers = currentPod.Spec.Containers
-	tPod.Spec.InitContainers = currentPod.Spec.InitContainers
-	tPod.Spec.NodeName = currentPod.Spec.NodeName
-
-	return p.HostClient.Update(ctx, tPod)
+	return p.withRetry(ctx, p.updatePod, pod)
 }
 
-// DeletePod takes a Kubernetes Pod and deletes it from the provider. Once a pod is deleted, the provider is
+func (p *Provider) updatePod(ctx context.Context, pod *v1.Pod) error {
+	p.logger.Debugw("got a request for update pod")
+
+	// Once scheduled a Pod cannot update other fields than the image of the containers, initcontainers and a few others
+	// See: https://kubernetes.io/docs/concepts/workloads/pods/#pod-update-and-replacement
+
+	// Update Pod in the virtual cluster
+
+	var currentVirtualPod v1.Pod
+	if err := p.VirtualClient.Get(ctx, client.ObjectKeyFromObject(pod), &currentVirtualPod); err != nil {
+		return fmt.Errorf("unable to get pod to update from virtual cluster: %w", err)
+	}
+
+	currentVirtualPod.Spec.Containers = updateContainerImages(currentVirtualPod.Spec.Containers, pod.Spec.Containers)
+	currentVirtualPod.Spec.InitContainers = updateContainerImages(currentVirtualPod.Spec.InitContainers, pod.Spec.InitContainers)
+
+	currentVirtualPod.Spec.ActiveDeadlineSeconds = pod.Spec.ActiveDeadlineSeconds
+	currentVirtualPod.Spec.Tolerations = pod.Spec.Tolerations
+
+	// in the virtual cluster we can update also the labels and annotations
+	currentVirtualPod.Annotations = pod.Annotations
+	currentVirtualPod.Labels = pod.Labels
+
+	if err := p.VirtualClient.Update(ctx, &currentVirtualPod); err != nil {
+		return fmt.Errorf("unable to update pod in the virtual cluster: %w", err)
+	}
+
+	// Update Pod in the host cluster
+
+	hostNamespaceName := types.NamespacedName{
+		Namespace: p.ClusterNamespace,
+		Name:      p.Translater.TranslateName(pod.Namespace, pod.Name),
+	}
+
+	var currentHostPod corev1.Pod
+	if err := p.HostClient.Get(ctx, hostNamespaceName, &currentHostPod); err != nil {
+		return fmt.Errorf("unable to get pod to update from host cluster: %w", err)
+	}
+
+	currentHostPod.Spec.Containers = updateContainerImages(currentHostPod.Spec.Containers, pod.Spec.Containers)
+	currentHostPod.Spec.InitContainers = updateContainerImages(currentHostPod.Spec.InitContainers, pod.Spec.InitContainers)
+
+	// update ActiveDeadlineSeconds and Tolerations
+	currentHostPod.Spec.ActiveDeadlineSeconds = pod.Spec.ActiveDeadlineSeconds
+	currentHostPod.Spec.Tolerations = pod.Spec.Tolerations
+
+	if err := p.HostClient.Update(ctx, &currentHostPod); err != nil {
+		return fmt.Errorf("unable to update pod in the host cluster: %w", err)
+	}
+
+	return nil
+}
+
+// updateContainerImages will update the images of the original container images with the same name
+func updateContainerImages(original, updated []v1.Container) []v1.Container {
+	newImages := make(map[string]string)
+
+	for _, c := range updated {
+		newImages[c.Name] = c.Image
+	}
+
+	for i, c := range original {
+		if updatedImage, found := newImages[c.Name]; found {
+			original[i].Image = updatedImage
+		}
+	}
+
+	return original
+}
+
+// DeletePod executes deletePod with retry
+func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
+	return p.withRetry(ctx, p.deletePod, pod)
+}
+
+// deletePod takes a Kubernetes Pod and deletes it from the provider. Once a pod is deleted, the provider is
 // expected to call the NotifyPods callback with a terminal pod status where all the containers are in a terminal
 // state, as well as the pod. DeletePod may be called multiple times for the same pod.
-func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
+func (p *Provider) deletePod(ctx context.Context, pod *corev1.Pod) error {
 	p.logger.Infof("Got request to delete pod %s", pod.Name)
 	hostName := p.Translater.TranslateName(pod.Namespace, pod.Name)
 	err := p.CoreClient.Pods(p.ClusterNamespace).Delete(ctx, hostName, metav1.DeleteOptions{})
@@ -602,10 +705,44 @@ func (p *Provider) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 	return retPods, nil
 }
 
-func (p *Provider) configureNetworking(podName, podNamespace string, pod *corev1.Pod) {
+// configureNetworking will inject network information to each pod to connect them to the
+// virtual cluster api server, as well as confiugre DNS information to connect them to the
+// synced coredns on the host cluster.
+func (p *Provider) configureNetworking(podName, podNamespace string, pod *corev1.Pod, serverIP string) {
+	// inject serverIP to hostalias for the pod
+	KubernetesHostAlias := corev1.HostAlias{
+		IP:        serverIP,
+		Hostnames: []string{"kubernetes", "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc.cluster", "kubernetes.default.svc.cluster.local"},
+	}
+	pod.Spec.HostAliases = append(pod.Spec.HostAliases, KubernetesHostAlias)
 	// inject networking information to the pod's environment variables
 	for i := range pod.Spec.Containers {
 		pod.Spec.Containers[i].Env = append(pod.Spec.Containers[i].Env,
+			corev1.EnvVar{
+				Name:  "KUBERNETES_PORT_443_TCP",
+				Value: "tcp://" + p.serverIP + ":6443",
+			},
+			corev1.EnvVar{
+				Name:  "KUBERNETES_PORT",
+				Value: "tcp://" + p.serverIP + ":6443",
+			},
+			corev1.EnvVar{
+				Name:  "KUBERNETES_PORT_443_TCP_ADDR",
+				Value: p.serverIP,
+			},
+			corev1.EnvVar{
+				Name:  "KUBERNETES_SERVICE_HOST",
+				Value: p.serverIP,
+			},
+			corev1.EnvVar{
+				Name:  "KUBERNETES_SERVICE_PORT",
+				Value: "6443",
+			},
+		)
+	}
+	// handle init contianers as well
+	for i := range pod.Spec.InitContainers {
+		pod.Spec.InitContainers[i].Env = append(pod.Spec.InitContainers[i].Env,
 			corev1.EnvVar{
 				Name:  "KUBERNETES_PORT_443_TCP",
 				Value: "tcp://" + p.serverIP + ":6443",
@@ -640,7 +777,6 @@ func (p *Provider) configureNetworking(podName, podNamespace string, pod *corev1
 			},
 		}
 	}
-
 }
 
 // getSecretsAndConfigmaps retrieves a list of all secrets/configmaps that are in use by a given pod. Useful
@@ -664,4 +800,29 @@ func getSecretsAndConfigmaps(pod *corev1.Pod) ([]string, []string) {
 		}
 	}
 	return secrets, configMaps
+}
+
+// fetchFieldPathAnnotations will retrieve all annotations created by the pod mutator webhook
+// to assign env fieldpaths to pods
+func (p *Provider) configureFieldPathEnv(pod, tPod *v1.Pod) error {
+	for name, value := range pod.Annotations {
+		if strings.Contains(name, webhook.FieldpathField) {
+			containerIndex, envName, err := webhook.ParseFieldPathAnnotationKey(name)
+			if err != nil {
+				return err
+			}
+			// re-adding these envs to the pod
+			tPod.Spec.Containers[containerIndex].Env = append(tPod.Spec.Containers[containerIndex].Env, v1.EnvVar{
+				Name: envName,
+				ValueFrom: &v1.EnvVarSource{
+					FieldRef: &v1.ObjectFieldSelector{
+						FieldPath: value,
+					},
+				},
+			})
+			// removing the annotation from the pod
+			delete(tPod.Annotations, name)
+		}
+	}
+	return nil
 }

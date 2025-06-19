@@ -30,7 +30,11 @@ spec:
       annotations:
         nginx.ingress.kubernetes.io/ssl-passthrough: "true"
         nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+<<<<<<< HEAD
         nginx.ingress.kubernetes.io/ssl-redirect: "true"
+=======
+        nginx.ingress.kubernetes.io/ssl-redirect: "HTTPS"
+>>>>>>> 08ba3944e0d5ee165de340a85515c8efa28dc672
 ```
 
 This will create a virtual cluster in `shared` mode and expose it via an ingress with the specified hostname.

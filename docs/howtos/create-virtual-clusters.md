@@ -30,7 +30,7 @@ spec:
       annotations:
         nginx.ingress.kubernetes.io/ssl-passthrough: "true"
         nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
-        nginx.ingress.kubernetes.io/ssl-redirect: "HTTPS"
+        nginx.ingress.kubernetes.io/ssl-redirect: "true"
 ```
 
 This will create a virtual cluster in `shared` mode and expose it via an ingress with the specified hostname.
@@ -265,9 +265,11 @@ metadata:
   name: k3kcluster-http-proxy
 spec:
   serverEnvs:
-    HTTP_PROXY: http://abc.xyz
+    - name: HTTP_PROXY
+      value: "http://abc.xyz"
   agentEnvs:
-    HTTP_PROXY: http://abc.xyz
+    - name: HTTP_PROXY
+      value: "http://abc.xyz"
 ```
 
 This configures an HTTP proxy for both servers and agents in the virtual cluster.  

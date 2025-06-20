@@ -4,22 +4,6 @@ This guide walks through common troubleshooting steps for working with K3K virtu
 
 ---
 
-## Enable Debug Logs
-
-Enabling debug logs helps when troubleshooting creation or runtime issues in virtual clusters.
-
-### CLI Method
-
-Add the `--debug` flag when creating the cluster:
-
-```sh
-k3kcli cluster create --debug debug-k3kcluster
-```
-
-This turns on verbose logs for the virtual cluster components.
-
----
-
 ## Virtual Cluster Fails with “too many open files” Error
 
 ### Symptom
@@ -56,6 +40,8 @@ Apply the changes:
 ```sh
 sudo sysctl -p
 ```
+
+You can find more details in this [KB document](https://www.suse.com/support/kb/doc/?id=000020048).
 
 ---
 

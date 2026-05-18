@@ -19,7 +19,7 @@ safe_mode() {
         CURRENT_IP=$(cat /var/lib/rancher/k3s/k3k-node-ip)
     fi
 
-    if [ -z "$CURRENT_IP" ] || [ "$CURRENT_IP" = "$POD_IP" ] || [ {{.K3K_MODE}} != "virtual" ]; then
+    if [ -z "$CURRENT_IP" ] || [ "$CURRENT_IP" = "$POD_IP" ] || [ "{{.K3K_MODE}}" = "shared" ] || [ "{{.K3K_MODE}}" = "hcp" ]; then
         return
     fi
 
@@ -94,8 +94,9 @@ start_ha_node() {
 
 # Configuring cgroups for k3s process in virtual mode
 configure_cgroups() {
-	# only configure the cgroups if the runtime used is the default and the mode is virtual
-	if [ -n "{{.RUNTIME_CLASS}}" ] || [ "{{.K3K_MODE}}" != "virtual" ]; then
+	# only configure the cgroups if the runtime used is the default and the mode is virtual.
+	# shared and hcp run agentless (no kubelet) and don't need cgroup overrides.
+	if [ -n "{{.RUNTIME_CLASS}}" ] || [ "{{.K3K_MODE}}" = "shared" ] || [ "{{.K3K_MODE}}" = "hcp" ]; then
 		return
 	fi
 
